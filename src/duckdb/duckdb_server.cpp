@@ -44,9 +44,11 @@
 #include "duckdb_statement_batch_reader.h"
 #include "duckdb_type_info.h"
 #include "duckdb_tables_schema_batch_reader.h"
+#include "caching_batch_reader.h"
 #include "gizmosql_security.h"
 #include "gizmosql_logging.h"
 #include "metrics.h"
+#include "query_result_cache.h"
 #include "flight_sql_fwd.h"
 #include "session_context.h"
 #include "request_ctx.h"
@@ -286,6 +288,9 @@ class DuckDBFlightSqlServer::Impl {
   std::thread cleanup_thread_;
   std::atomic<bool> stop_cleanup_{false};
 
+  // P2-3: Query result cache (shared_ptr for safe lifetime management)
+  std::shared_ptr<QueryResultCache> query_result_cache_;
+
   Result<std::shared_ptr<DuckDBStatement>> GetStatementByHandle(
       const std::string& handle) {
     auto statement = prepared_statements_.Get(handle);
@@ -458,7 +463,8 @@ class DuckDBFlightSqlServer::Impl {
       : db_instance_(std::move(db_instance)),
         print_queries_(print_queries),
         query_timeout_(query_timeout),
-        prepared_statements_(1024) {  // LRU cache with max 1024 entries
+        prepared_statements_(1024),  // LRU cache with max 1024 entries
+        query_result_cache_(std::make_shared<QueryResultCache>()) {  // P2-3: Initialize cache
     // Start background session cleanup task
     StartCleanupTask();
   }
@@ -497,11 +503,43 @@ class DuckDBFlightSqlServer::Impl {
     const std::string& sql = pair.first;
     const std::string transaction_id = pair.second;
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
+
+    // P2-3: Generate cache key including session context to avoid cross-session pollution
+    // CRITICAL: Different sessions may have different catalog/schema/role settings
+    std::string cache_key = GenerateCacheKey(sql, {client_session->session_id});
+
+    // P2-3: Try to get cached result
+    std::vector<std::shared_ptr<arrow::RecordBatch>> cached_batches;
+    std::shared_ptr<arrow::Schema> cached_schema;
+
+    bool is_write_op = IsWriteOperation(sql);
+
+    // Only check cache for read queries
+    if (!is_write_op && query_result_cache_->Get(cache_key, cached_batches, cached_schema)) {
+      // Cache hit!
+      METRICS_INCREMENT_COUNTER("gizmosql_query_cache_hits_total", 1);
+      auto reader = std::make_shared<CachedResultReader>(cached_batches, cached_schema);
+      return std::make_unique<flight::RecordBatchStream>(reader);
+    }
+
+    // Cache miss or write operation
+    METRICS_INCREMENT_COUNTER("gizmosql_query_cache_misses_total", 1);
+
+    // Create statement and reader
     ARROW_ASSIGN_OR_RAISE(auto statement,
                           DuckDBStatement::Create(client_session, sql,
                                                   arrow::util::ArrowLogLevel::ARROW_INFO,
                                                   print_queries_, query_timeout_))
     ARROW_ASSIGN_OR_RAISE(auto reader, DuckDBStatementBatchReader::Create(statement))
+
+    // If write operation, invalidate cache
+    if (is_write_op) {
+      query_result_cache_->InvalidateAll();
+      METRICS_INCREMENT_COUNTER("gizmosql_query_cache_invalidations_total", 1);
+    } else {
+      // For read queries, wrap reader to cache results (shared_ptr ensures safe lifetime)
+      reader = std::make_shared<CachingRecordBatchReader>(reader, query_result_cache_, cache_key);
+    }
 
     return std::make_unique<flight::RecordBatchStream>(reader);
   }
