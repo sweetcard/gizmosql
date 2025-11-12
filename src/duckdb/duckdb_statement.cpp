@@ -270,6 +270,29 @@ arrow::Result<int> DuckDBStatement::Execute() {
     client_session_->connection->Interrupt();
     client_session_->active_sql_handle = "";
 
+    // CRITICAL FIX: Wait for the thread to finish after interrupt
+    // This prevents thread leaks
+    try {
+      // Wait up to 5 seconds for the thread to exit gracefully
+      auto wait_status = future.wait_for(std::chrono::seconds(5));
+
+      if (wait_status == std::future_status::ready) {
+        // Thread has exited, consume the result (may be an error)
+        try {
+          future.get();  // Consume result to avoid exception on destruction
+        } catch (...) {
+          // Ignore exceptions - query already timed out
+        }
+      } else {
+        // Thread still running after interrupt (rare with DuckDB)
+        GIZMOSQL_LOG(WARNING) << "Query thread did not exit after Interrupt() for session: "
+                              << client_session_->session_id
+                              << " - potential thread leak";
+      }
+    } catch (const std::exception& e) {
+      GIZMOSQL_LOG(ERROR) << "Exception during timeout cleanup: " << e.what();
+    }
+
     if (log_queries_) {
       GIZMOSQL_LOGKV(
           WARNING, "Client SQL command timed out", {"peer", client_session_->peer},

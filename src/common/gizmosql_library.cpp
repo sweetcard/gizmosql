@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <regex>
 #include <vector>
+#include <thread>
 #include <arrow/flight/client.h>
 #include <arrow/flight/sql/server.h>
 #include <boost/algorithm/string.hpp>
@@ -136,7 +137,20 @@ arrow::Result<std::shared_ptr<flight::sql::FlightSqlServerBase>> FlightSQLServer
                               database_filename, read_only, print_queries, query_timeout))
     // Run additional commands (first) for the DuckDB back-end...
     auto duckdb_init_sql_commands =
-        "SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;" +
+        "SET autoinstall_known_extensions = true; "
+        "SET autoload_known_extensions = true; "
+        // Performance optimizations
+        "SET threads = " + std::to_string(std::thread::hardware_concurrency()) + "; "
+        "SET max_memory = '80%'; "
+        "SET temp_directory = '/tmp/gizmosql'; "
+        // Enable optimizer
+        "SET enable_optimizer = true; "
+        "SET optimizer_use_statistics = true; "
+        "SET enable_optimizer_statistics = true; "
+        // Parallel execution settings
+        "SET parallel_aggregation = true; "
+        "SET parallel_join = true; "
+        "SET preserve_insertion_order = false;" +  // Performance over order
         init_sql_commands;
     RUN_INIT_COMMANDS(duckdb_server, duckdb_init_sql_commands);
     server = duckdb_server;

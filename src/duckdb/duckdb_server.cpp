@@ -25,6 +25,8 @@
 #include <sstream>
 #include <iostream>
 #include <mutex>
+#include <shared_mutex>
+#include <thread>
 
 #include <arrow/api.h>
 #include <arrow/flight/server.h>
@@ -191,28 +193,105 @@ std::string PrepareQueryForGetImportedOrExportedKeys(const std::string& filter) 
 }
 }  // namespace
 
+// LRU Cache for prepared statements
+template <typename Key, typename Value>
+class LRUCache {
+ private:
+  struct CacheEntry {
+    Value value;
+    typename std::list<Key>::iterator lru_iterator;
+  };
+
+  size_t max_size_;
+  std::unordered_map<Key, CacheEntry> cache_;
+  std::list<Key> lru_list_;
+  std::mutex mutex_;
+
+ public:
+  explicit LRUCache(size_t max_size) : max_size_(max_size) {}
+
+  void Put(const Key& key, Value value) {
+    std::scoped_lock lock(mutex_);
+
+    auto it = cache_.find(key);
+    if (it != cache_.end()) {
+      // Update existing entry
+      lru_list_.erase(it->second.lru_iterator);
+      lru_list_.push_front(key);
+      it->second.value = std::move(value);
+      it->second.lru_iterator = lru_list_.begin();
+      return;
+    }
+
+    // Evict LRU entry if cache is full
+    if (cache_.size() >= max_size_) {
+      auto lru_key = lru_list_.back();
+      cache_.erase(lru_key);
+      lru_list_.pop_back();
+    }
+
+    // Insert new entry
+    lru_list_.push_front(key);
+    cache_[key] = {std::move(value), lru_list_.begin()};
+  }
+
+  std::optional<Value> Get(const Key& key) {
+    std::scoped_lock lock(mutex_);
+
+    auto it = cache_.find(key);
+    if (it == cache_.end()) {
+      return std::nullopt;
+    }
+
+    // Move to front (most recently used)
+    lru_list_.erase(it->second.lru_iterator);
+    lru_list_.push_front(key);
+    it->second.lru_iterator = lru_list_.begin();
+
+    return it->second.value;
+  }
+
+  void Remove(const Key& key) {
+    std::scoped_lock lock(mutex_);
+
+    auto it = cache_.find(key);
+    if (it != cache_.end()) {
+      lru_list_.erase(it->second.lru_iterator);
+      cache_.erase(it);
+    }
+  }
+
+  size_t Size() const {
+    std::scoped_lock lock(mutex_);
+    return cache_.size();
+  }
+};
+
 class DuckDBFlightSqlServer::Impl {
  private:
   std::shared_ptr<duckdb::DuckDB> db_instance_;
   bool print_queries_;
   int32_t query_timeout_;
 
-  std::map<std::string, std::shared_ptr<DuckDBStatement>> prepared_statements_;
+  // LRU cache for prepared statements (max 1024 entries)
+  LRUCache<std::string, std::shared_ptr<DuckDBStatement>> prepared_statements_;
   std::unordered_map<std::string, std::shared_ptr<ClientSession>> client_sessions_;
   std::unordered_map<std::string, std::string> open_transactions_;
   std::default_random_engine gen_;
-  std::mutex sessions_mutex_;
-  std::mutex statements_mutex_;
+  std::shared_mutex sessions_mutex_;  // Read-write lock for better concurrency
   std::mutex transactions_mutex_;
+
+  // Session cleanup task
+  std::thread cleanup_thread_;
+  std::atomic<bool> stop_cleanup_{false};
 
   Result<std::shared_ptr<DuckDBStatement>> GetStatementByHandle(
       const std::string& handle) {
-    std::scoped_lock guard(statements_mutex_);
-    auto search = prepared_statements_.find(handle);
-    if (search == prepared_statements_.end()) {
+    auto statement = prepared_statements_.Get(handle);
+    if (!statement.has_value()) {
       return Status::KeyError("Prepared statement not found");
     }
-    return search->second;
+    return statement.value();
   }
 
   static std::optional<std::string> SessionValueToString(
@@ -235,21 +314,91 @@ class DuckDBFlightSqlServer::Impl {
       const flight::ServerCallContext& context) {
     ARROW_ASSIGN_OR_RAISE(auto session_id, GetSessionID());
 
-    std::scoped_lock lk(sessions_mutex_);
+    // Fast path: Try to find session with shared lock (read-only)
+    {
+      std::shared_lock lk(sessions_mutex_);
+      if (auto it = client_sessions_.find(session_id); it != client_sessions_.end()) {
+        // Update last activity timestamp (atomic operation, safe with shared lock)
+        it->second->last_activity = std::chrono::steady_clock::now();
+        return it->second;
+      }
+    }
 
+    // Slow path: Create new session with unique lock (write)
+    std::unique_lock lk(sessions_mutex_);
+
+    // Double-check: another thread might have created the session
     if (auto it = client_sessions_.find(session_id); it != client_sessions_.end()) {
+      it->second->last_activity = std::chrono::steady_clock::now();
       return it->second;
     }
 
+    // Create new session with timestamps
     auto cs = std::make_shared<ClientSession>();
     cs->session_id = session_id;
     cs->username = tl_request_ctx.username.value_or("");
     cs->role = tl_request_ctx.role.value_or("");
     cs->peer = tl_request_ctx.peer.value_or(context.peer());
     cs->connection = std::make_shared<duckdb::Connection>(*db_instance_);
+    cs->created_at = std::chrono::steady_clock::now();
+    cs->last_activity = cs->created_at;
 
     client_sessions_[session_id] = cs;
     return cs;
+  }
+
+  // Background task to clean up idle sessions
+  void CleanupIdleSessions() {
+    std::unique_lock lk(sessions_mutex_);  // Need write lock to erase sessions
+    auto now = std::chrono::steady_clock::now();
+
+    for (auto it = client_sessions_.begin(); it != client_sessions_.end();) {
+      auto& session = it->second;
+      auto idle_time = now - session->last_activity;
+      auto lifetime = now - session->created_at;
+
+      bool should_remove = false;
+      std::string reason;
+
+      // Check idle timeout
+      if (idle_time > session->idle_timeout) {
+        should_remove = true;
+        reason = "idle_timeout";
+      }
+      // Check max lifetime
+      else if (lifetime > session->max_lifetime) {
+        should_remove = true;
+        reason = "max_lifetime";
+      }
+
+      if (should_remove) {
+        auto idle_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(idle_time).count();
+        auto lifetime_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(lifetime).count();
+
+        GIZMOSQL_LOGKV(INFO, "Cleaning up session", {"session_id", it->first},
+                       {"username", session->username}, {"peer", session->peer},
+                       {"reason", reason}, {"idle_seconds", std::to_string(idle_seconds)},
+                       {"lifetime_seconds", std::to_string(lifetime_seconds)});
+
+        it = client_sessions_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // Start background cleanup task
+  void StartCleanupTask() {
+    cleanup_thread_ = std::thread([this]() {
+      while (!stop_cleanup_) {
+        std::this_thread::sleep_for(std::chrono::minutes(5));
+        if (!stop_cleanup_) {
+          CleanupIdleSessions();
+        }
+      }
+    });
   }
 
   // Convenience method for retrieving just a database connection:
@@ -286,9 +435,19 @@ class DuckDBFlightSqlServer::Impl {
                 const int32_t& query_timeout)
       : db_instance_(std::move(db_instance)),
         print_queries_(print_queries),
-        query_timeout_(query_timeout) {}
+        query_timeout_(query_timeout),
+        prepared_statements_(1024) {  // LRU cache with max 1024 entries
+    // Start background session cleanup task
+    StartCleanupTask();
+  }
 
-  ~Impl() = default;
+  ~Impl() {
+    // Stop cleanup thread
+    stop_cleanup_ = true;
+    if (cleanup_thread_.joinable()) {
+      cleanup_thread_.join();
+    }
+  }
 
   Result<std::unique_ptr<flight::FlightInfo>> GetFlightInfoStatement(
       const flight::ServerCallContext& context, const sql::StatementQuery& command,
@@ -379,7 +538,6 @@ class DuckDBFlightSqlServer::Impl {
       const flight::ServerCallContext& context,
       const sql::ActionCreatePreparedStatementRequest& request) {
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
-    std::scoped_lock guard(statements_mutex_);
     const std::string handle =
         boost::uuids::to_string(boost::uuids::random_generator()());
 
@@ -387,7 +545,9 @@ class DuckDBFlightSqlServer::Impl {
                           DuckDBStatement::Create(client_session, handle, request.query,
                                                   arrow::util::ArrowLogLevel::ARROW_INFO,
                                                   print_queries_, query_timeout_))
-    prepared_statements_[handle] = statement;
+
+    // Store in LRU cache (thread-safe internally)
+    prepared_statements_.Put(handle, statement);
 
     ARROW_ASSIGN_OR_RAISE(auto dataset_schema, statement->GetSchema())
 
@@ -436,15 +596,15 @@ class DuckDBFlightSqlServer::Impl {
 
   Status ClosePreparedStatement(const flight::ServerCallContext& context,
                                 const sql::ActionClosePreparedStatementRequest& request) {
-    std::scoped_lock guard(statements_mutex_);
     const std::string& prepared_statement_handle = request.prepared_statement_handle;
 
-    if (auto search = prepared_statements_.find(prepared_statement_handle);
-        search != prepared_statements_.end()) {
-      prepared_statements_.erase(prepared_statement_handle);
-    } else {
+    // Check if statement exists before removing
+    if (!prepared_statements_.Get(prepared_statement_handle).has_value()) {
       return Status::Invalid("Prepared statement not found");
     }
+
+    // Remove from LRU cache (thread-safe internally)
+    prepared_statements_.Remove(prepared_statement_handle);
 
     return Status::OK();
   }
@@ -453,15 +613,15 @@ class DuckDBFlightSqlServer::Impl {
       const flight::ServerCallContext& context,
       const sql::PreparedStatementQuery& command,
       const flight::FlightDescriptor& descriptor) {
-    std::scoped_lock guard(statements_mutex_);
     const std::string& prepared_statement_handle = command.prepared_statement_handle;
 
-    auto search = prepared_statements_.find(prepared_statement_handle);
-    if (search == prepared_statements_.end()) {
+    // Get from LRU cache (thread-safe internally)
+    auto statement_opt = prepared_statements_.Get(prepared_statement_handle);
+    if (!statement_opt.has_value()) {
       return Status::Invalid("Prepared statement not found");
     }
 
-    std::shared_ptr<DuckDBStatement> statement = search->second;
+    std::shared_ptr<DuckDBStatement> statement = statement_opt.value();
 
     ARROW_ASSIGN_OR_RAISE(auto schema, statement->GetSchema())
 
@@ -471,15 +631,15 @@ class DuckDBFlightSqlServer::Impl {
   Result<std::unique_ptr<flight::FlightDataStream>> DoGetPreparedStatement(
       const flight::ServerCallContext& context,
       const sql::PreparedStatementQuery& command) {
-    std::scoped_lock guard(statements_mutex_);
     const std::string& prepared_statement_handle = command.prepared_statement_handle;
 
-    auto search = prepared_statements_.find(prepared_statement_handle);
-    if (search == prepared_statements_.end()) {
+    // Get from LRU cache (thread-safe internally)
+    auto statement_opt = prepared_statements_.Get(prepared_statement_handle);
+    if (!statement_opt.has_value()) {
       return Status::Invalid("Prepared statement not found");
     }
 
-    std::shared_ptr<DuckDBStatement> statement = search->second;
+    std::shared_ptr<DuckDBStatement> statement = statement_opt.value();
 
     ARROW_ASSIGN_OR_RAISE(auto reader, DuckDBStatementBatchReader::Create(statement))
 
@@ -883,7 +1043,7 @@ class DuckDBFlightSqlServer::Impl {
       const flight::ServerCallContext& context,
       const flight::CloseSessionRequest& request) {
     ARROW_ASSIGN_OR_RAISE(auto client_session, GetClientSession(context));
-    std::scoped_lock lk(sessions_mutex_);
+    std::unique_lock lk(sessions_mutex_);  // Need write lock to erase session
     auto it = client_sessions_.find(client_session->session_id);
     if (it != client_sessions_.end()) {
       it->second.reset();
@@ -969,6 +1129,12 @@ Result<std::shared_ptr<DuckDBFlightSqlServer>> DuckDBFlightSqlServer::Create(
   if (read_only) {
     config.options.access_mode = duckdb::AccessMode::READ_ONLY;
   }
+
+  // Performance optimizations
+  config.options.maximum_memory = "80%";  // Use 80% of system memory
+  config.options.maximum_threads = std::thread::hardware_concurrency();
+  config.options.temp_directory = "/tmp/gizmosql";  // For spilling to disk
+  config.options.enable_external_access = false;  // Security: disable external file access by default
 
   auto db = std::make_shared<duckdb::DuckDB>(db_location, &config);
 

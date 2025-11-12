@@ -2,6 +2,7 @@
 #pragma once
 #include <memory>
 #include <string>
+#include <chrono>
 #include <duckdb.hpp>
 
 struct ClientSession {
@@ -11,4 +12,12 @@ struct ClientSession {
   std::string role; // from JWT claims (e.g. "role") or header
   std::string peer; // client ip:port (ctx.peer())
   std::optional<std::string> active_sql_handle;
+
+  // Session lifetime tracking (for TTL)
+  std::chrono::steady_clock::time_point created_at;
+  std::chrono::steady_clock::time_point last_activity;
+
+  // Configurable timeouts (defaults: 1 hour idle, 24 hours max lifetime)
+  std::chrono::seconds idle_timeout = std::chrono::seconds(3600);    // 1 hour
+  std::chrono::seconds max_lifetime = std::chrono::seconds(86400);   // 24 hours
 };
