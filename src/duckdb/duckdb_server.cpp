@@ -205,7 +205,7 @@ class LRUCache {
   size_t max_size_;
   std::unordered_map<Key, CacheEntry> cache_;
   std::list<Key> lru_list_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;  // mutable to allow locking in const methods
 
  public:
   explicit LRUCache(size_t max_size) : max_size_(max_size) {}
@@ -319,7 +319,7 @@ class DuckDBFlightSqlServer::Impl {
       std::shared_lock lk(sessions_mutex_);
       if (auto it = client_sessions_.find(session_id); it != client_sessions_.end()) {
         // Update last activity timestamp (atomic operation, safe with shared lock)
-        it->second->last_activity = std::chrono::steady_clock::now();
+        it->second->set_last_activity(std::chrono::steady_clock::now());
         return it->second;
       }
     }
@@ -329,7 +329,7 @@ class DuckDBFlightSqlServer::Impl {
 
     // Double-check: another thread might have created the session
     if (auto it = client_sessions_.find(session_id); it != client_sessions_.end()) {
-      it->second->last_activity = std::chrono::steady_clock::now();
+      it->second->set_last_activity(std::chrono::steady_clock::now());
       return it->second;
     }
 
@@ -340,8 +340,9 @@ class DuckDBFlightSqlServer::Impl {
     cs->role = tl_request_ctx.role.value_or("");
     cs->peer = tl_request_ctx.peer.value_or(context.peer());
     cs->connection = std::make_shared<duckdb::Connection>(*db_instance_);
-    cs->created_at = std::chrono::steady_clock::now();
-    cs->last_activity = cs->created_at;
+    auto now = std::chrono::steady_clock::now();
+    cs->set_created_at(now);
+    cs->set_last_activity(now);
 
     client_sessions_[session_id] = cs;
     return cs;
@@ -354,8 +355,8 @@ class DuckDBFlightSqlServer::Impl {
 
     for (auto it = client_sessions_.begin(); it != client_sessions_.end();) {
       auto& session = it->second;
-      auto idle_time = now - session->last_activity;
-      auto lifetime = now - session->created_at;
+      auto idle_time = now - session->get_last_activity();
+      auto lifetime = now - session->get_created_at();
 
       bool should_remove = false;
       std::string reason;
@@ -395,7 +396,13 @@ class DuckDBFlightSqlServer::Impl {
       while (!stop_cleanup_) {
         std::this_thread::sleep_for(std::chrono::minutes(5));
         if (!stop_cleanup_) {
-          CleanupIdleSessions();
+          try {
+            CleanupIdleSessions();
+          } catch (const std::exception& e) {
+            GIZMOSQL_LOG(ERROR) << "Session cleanup failed: " << e.what();
+          } catch (...) {
+            GIZMOSQL_LOG(ERROR) << "Session cleanup failed: unknown error";
+          }
         }
       }
     });
@@ -1133,7 +1140,19 @@ Result<std::shared_ptr<DuckDBFlightSqlServer>> DuckDBFlightSqlServer::Create(
   // Performance optimizations
   config.options.maximum_memory = "80%";  // Use 80% of system memory
   config.options.maximum_threads = std::thread::hardware_concurrency();
-  config.options.temp_directory = "/tmp/gizmosql";  // For spilling to disk
+
+  // Create temp directory for spilling to disk
+  std::filesystem::path temp_dir = "/tmp/gizmosql";
+  std::error_code ec;
+  std::filesystem::create_directories(temp_dir, ec);
+  if (ec) {
+    GIZMOSQL_LOG(WARNING) << "Failed to create temp directory " << temp_dir
+                          << ": " << ec.message() << ". Using system temp directory.";
+    temp_dir = std::filesystem::temp_directory_path() / "gizmosql";
+    std::filesystem::create_directories(temp_dir);
+  }
+  config.options.temp_directory = temp_dir.string();
+
   config.options.enable_external_access = false;  // Security: disable external file access by default
 
   auto db = std::make_shared<duckdb::DuckDB>(db_location, &config);

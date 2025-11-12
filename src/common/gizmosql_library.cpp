@@ -126,6 +126,18 @@ arrow::Result<std::shared_ptr<flight::sql::FlightSqlServerBase>> FlightSQLServer
   ARROW_ASSIGN_OR_RAISE(duckdb_server,
                         gizmosql::ddb::DuckDBFlightSqlServer::Create(
                             database_filename, read_only, print_queries, query_timeout))
+
+  // Create temp directory for DuckDB (if needed)
+  std::filesystem::path temp_dir = "/tmp/gizmosql";
+  std::error_code ec;
+  std::filesystem::create_directories(temp_dir, ec);
+  if (ec) {
+    GIZMOSQL_LOG(WARNING) << "Failed to create temp directory " << temp_dir
+                          << ": " << ec.message() << ". Using system temp directory.";
+    temp_dir = std::filesystem::temp_directory_path() / "gizmosql";
+    std::filesystem::create_directories(temp_dir);
+  }
+
   // Run additional commands (first) for the DuckDB back-end...
   auto duckdb_init_sql_commands =
       "SET autoinstall_known_extensions = true; "
@@ -133,7 +145,7 @@ arrow::Result<std::shared_ptr<flight::sql::FlightSqlServerBase>> FlightSQLServer
       // Performance optimizations
       "SET threads = " + std::to_string(std::thread::hardware_concurrency()) + "; "
       "SET max_memory = '80%'; "
-      "SET temp_directory = '/tmp/gizmosql'; "
+      "SET temp_directory = '" + temp_dir.string() + "'; "
       // Enable optimizer
       "SET enable_optimizer = true; "
       "SET optimizer_use_statistics = true; "
