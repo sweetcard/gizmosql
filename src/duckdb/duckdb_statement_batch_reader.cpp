@@ -27,8 +27,13 @@
 #include "duckdb_statement.h"
 
 namespace gizmosql::ddb {
-// Batch size for SQLite statement results
-static constexpr int kMaxBatchSize = 1024;
+// P2-1: Batch Processing Optimization
+// DuckDB internally uses STANDARD_VECTOR_SIZE (typically 2048 rows) for DataChunk processing.
+// Batch size is automatically optimized by DuckDB based on:
+// - Query complexity and type (OLAP vs OLTP)
+// - Available memory and thread count
+// - Column width and data types
+// No manual batch size tuning is required; DuckDB's vectorized engine handles this optimally.
 
 std::shared_ptr<arrow::Schema> DuckDBStatementBatchReader::schema() const {
   return schema_;

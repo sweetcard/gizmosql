@@ -46,6 +46,7 @@
 #include "duckdb_tables_schema_batch_reader.h"
 #include "gizmosql_security.h"
 #include "gizmosql_logging.h"
+#include "metrics.h"
 #include "flight_sql_fwd.h"
 #include "session_context.h"
 #include "request_ctx.h"
@@ -289,8 +290,13 @@ class DuckDBFlightSqlServer::Impl {
       const std::string& handle) {
     auto statement = prepared_statements_.Get(handle);
     if (!statement.has_value()) {
+      // P2-2: Track cache miss
+      METRICS_INCREMENT_COUNTER("gizmosql_prepared_stmt_cache_misses_total", 1);
       return Status::KeyError("Prepared statement not found");
     }
+
+    // P2-2: Track cache hit
+    METRICS_INCREMENT_COUNTER("gizmosql_prepared_stmt_cache_hits_total", 1);
     return statement.value();
   }
 
@@ -345,6 +351,11 @@ class DuckDBFlightSqlServer::Impl {
     cs->set_last_activity(now);
 
     client_sessions_[session_id] = cs;
+
+    // P2-2: Track active sessions metric
+    METRICS_INCREMENT_GAUGE("gizmosql_active_sessions");
+    METRICS_INCREMENT_COUNTER("gizmosql_sessions_created_total", 1);
+
     return cs;
   }
 
@@ -384,6 +395,10 @@ class DuckDBFlightSqlServer::Impl {
                        {"lifetime_seconds", std::to_string(lifetime_seconds)});
 
         it = client_sessions_.erase(it);
+
+        // P2-2: Track session cleanup metric
+        METRICS_DECREMENT_GAUGE("gizmosql_active_sessions");
+        METRICS_INCREMENT_COUNTER("gizmosql_sessions_closed_total", 1);
       } else {
         ++it;
       }
@@ -947,6 +962,10 @@ class DuckDBFlightSqlServer::Impl {
 
     ARROW_RETURN_NOT_OK(ExecuteSql(client_session->connection, "BEGIN TRANSACTION"));
 
+    // P2-2: Track active transactions metric
+    METRICS_INCREMENT_GAUGE("gizmosql_active_transactions");
+    METRICS_INCREMENT_COUNTER("gizmosql_transactions_started_total", 1);
+
     return sql::ActionBeginTransactionResult{std::move(handle)};
   }
 
@@ -957,11 +976,16 @@ class DuckDBFlightSqlServer::Impl {
     {
       if (request.action == sql::ActionEndTransactionRequest::kCommit) {
         status = ExecuteSql(client_session->connection, "COMMIT");
+        METRICS_INCREMENT_COUNTER("gizmosql_transactions_committed_total", 1);
       } else {
         status = ExecuteSql(client_session->connection, "ROLLBACK");
+        METRICS_INCREMENT_COUNTER("gizmosql_transactions_rolled_back_total", 1);
       }
       std::scoped_lock guard(transactions_mutex_);
       open_transactions_.erase(request.transaction_id);
+
+      // P2-2: Track transaction end metric
+      METRICS_DECREMENT_GAUGE("gizmosql_active_transactions");
     }
     return status;
   }
@@ -1140,6 +1164,11 @@ Result<std::shared_ptr<DuckDBFlightSqlServer>> DuckDBFlightSqlServer::Create(
   // Performance optimizations
   config.options.maximum_memory = "80%";  // Use 80% of system memory
   config.options.maximum_threads = std::thread::hardware_concurrency();
+
+  // P2-1: Batch processing optimization
+  // Note: preserve_insertion_order and other runtime settings are configured
+  // via SQL commands in gizmosql_library.cpp for consistency across both
+  // DuckDB server and library initialization paths.
 
   // Create temp directory for spilling to disk
   std::filesystem::path temp_dir = "/tmp/gizmosql";

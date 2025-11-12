@@ -31,6 +31,7 @@
 #include <arrow/c/bridge.h>
 #include "duckdb_server.h"
 #include "session_context.h"
+#include "metrics.h"
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
@@ -387,6 +388,9 @@ arrow::Result<int> DuckDBStatement::Execute() {
           {"sql", redact_sql_for_logs(use_direct_execution_ ? sql_ : stmt_->query)});
     }
 
+    // P2-2: Track query timeout metric
+    METRICS_INCREMENT_COUNTER("gizmosql_query_timeouts_total", 1);
+
     return arrow::Status::ExecutionError("Query execution timed out after ",
                                          std::to_string(timeout_duration.count()),
                                          " seconds");
@@ -400,6 +404,14 @@ arrow::Result<int> DuckDBStatement::Execute() {
   client_session_->active_sql_handle = "";
 
   end_time_ = std::chrono::steady_clock::now();
+
+  // P2-2: Track query latency histogram
+  auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      end_time_ - start_time_).count();
+  METRICS_OBSERVE_HISTOGRAM("gizmosql_query_duration_milliseconds",
+                            static_cast<double>(duration_ms));
+  METRICS_INCREMENT_COUNTER("gizmosql_queries_executed_total", 1);
+
   if (log_queries_ && result.ok()) {
     GIZMOSQL_LOGKV_DYNAMIC(
         log_level_, "Client SQL command execution succeeded",
