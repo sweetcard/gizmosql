@@ -32,8 +32,6 @@ int main(int argc, char** argv) {
     desc.add_options()
             ("help", "produce this help message")
             ("version", "Print the version and exit")
-            ("backend,B", po::value<std::string>()->default_value("duckdb"),
-             "Specify the database backend. Allowed options: duckdb, sqlite.")
             ("hostname,H", po::value<std::string>()->default_value(""),
              "Specify the hostname to listen on for the GizmoSQL Server.  If not set, we will use env var: 'GIZMOSQL_HOSTNAME'.  "
              "If that isn't set, we will use the default of: '0.0.0.0'.")
@@ -100,16 +98,8 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::string backend_str = vm["backend"].as<std::string>();
-  BackendType backend;
-  if (backend_str == "duckdb") {
-    backend = BackendType::duckdb;
-  } else if (backend_str == "sqlite") {
-    backend = BackendType::sqlite;
-  } else {
-    GIZMOSQL_LOG(INFO) << "Invalid backend: " << backend_str;
-    return 1;
-  }
+  // GizmoSQL now only supports DuckDB backend
+  BackendType backend = BackendType::duckdb;
 
   auto database_filename = fs::path(vm["database-filename"].as<std::string>());
 

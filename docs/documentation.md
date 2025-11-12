@@ -1,6 +1,6 @@
 # 📚 GizmoSQL Documentation
 
-Welcome to the official documentation for **GizmoSQL**, a high-performance, embeddable SQL server built on [DuckDB](https://duckdb.org) and [SQLite](https://sqlite.org), exposed through [Apache Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html).
+Welcome to the official documentation for **GizmoSQL**, a high-performance, embeddable SQL server built on [DuckDB](https://duckdb.org), exposed through [Apache Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html).
 
 ---
 
@@ -29,7 +29,7 @@ Welcome to the official documentation for **GizmoSQL**, a high-performance, embe
 
 ## 🧩 Overview
 
-**GizmoSQL** enables the execution of SQL queries using DuckDB or SQLite as backends, accessed remotely over Arrow Flight SQL. The server supports TLS, password authentication, and JWT issuance via middleware.
+**GizmoSQL** enables the execution of SQL queries using DuckDB as the backend, accessed remotely over Arrow Flight SQL. The server supports TLS, password authentication, and JWT issuance via middleware.
 
 It was forked from [`sqlflite`](https://github.com/voltrondata/sqlflite) and has been extended significantly under the Apache 2.0 license.
 
@@ -43,7 +43,7 @@ It was forked from [`sqlflite`](https://github.com/voltrondata/sqlflite) and has
 
 ### Copyright © 2025 GizmoData LLC
 
-## An [Arrow Flight SQL Server](https://arrow.apache.org/docs/format/FlightSql.html) with [DuckDB](https://duckdb.org) or [SQLite](https://sqlite.org) back-end execution engines
+## An [Arrow Flight SQL Server](https://arrow.apache.org/docs/format/FlightSql.html) with [DuckDB](https://duckdb.org) backend execution engine
 
 [<img src="https://img.shields.io/badge/dockerhub-image-green.svg?logo=Docker">](https://hub.docker.com/r/gizmodata/gizmosql)
 [<img src="https://img.shields.io/badge/github--package-container--image-green.svg?logo=Docker">](https://github.com/gizmodata/gizmosql/pkgs/container/gizmosql)
@@ -55,7 +55,7 @@ It was forked from [`sqlflite`](https://github.com/voltrondata/sqlflite) and has
 
 ## Description
 
-This is the GizmoSQL core repo - used to build an Apache Arrow Flight SQL server implementation using DuckDB or SQLite as a backend database.
+This is the GizmoSQL core repo - used to build an Apache Arrow Flight SQL server implementation using DuckDB as the backend database.
 
 It enables authentication via middleware and allows for encrypted connections to the database via TLS.
 
@@ -68,7 +68,6 @@ It is originally **forked from [`sqlflite`](https://github.com/voltrondata/sqlfl
 | Component                                                                        | Version |
 |----------------------------------------------------------------------------------|---------|
 | [DuckDB](https://duckdb.org)                                                     | v1.4.1  |
-| [SQLite](https://sqlite.org)                                                     | 3.50.4  |
 | [Apache Arrow (Flight SQL)](https://arrow.apache.org/docs/format/FlightSql.html) | 22.0.0 |
 | [jwt-cpp](https://thalhammer.github.io/jwt-cpp/)                                 | v0.7.1  |
 | [nlohmann/json](https://json.nlohmann.me)                                        | v3.12.0 |
@@ -307,7 +306,7 @@ gizmosql_server --help
 
 
 
-In order to run build the solution manually, and run SQLite and DuckDB Flight SQL server, you need to set up a new Python 3.9+ virtual environment on your machine. 
+In order to build the solution manually and run the DuckDB Flight SQL server, you need to set up a new Python 3.9+ virtual environment on your machine.
 Follow these steps to do so (thanks to David Li!).
 
 1. Clone the repo and build the static library and executable
@@ -328,12 +327,7 @@ pip install --upgrade pip setuptools wheel
 pip install --requirement ./requirements.txt
 ````
 
-3. Get some SQLite3 sample data.
-```bash
-wget https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H-small.db -O ./data/TPC-H-small.sqlite
-```
-
-4. Create a DuckDB database.
+3. Create a DuckDB database.
 ```bash
 python "scripts/create_duckdb_database_file.py" \
        --file-name="TPC-H-small.duckdb" \
@@ -342,14 +336,14 @@ python "scripts/create_duckdb_database_file.py" \
        --scale-factor=0.01
 ```
 
-5. Optionally generate TLS certificates for encrypting traffic to/from the Flight SQL server
+4. Optionally generate TLS certificates for encrypting traffic to/from the Flight SQL server
 ```bash
 pushd tls
 ./gen-certs.sh
 popd
 ```
 
-6. Start the Flight SQL server (and print client SQL commands as they run using the --print-queries option)
+5. Start the Flight SQL server (and print client SQL commands as they run using the --print-queries option)
 ```bash
 GIZMOSQL_PASSWORD="gizmosql_password" gizmosql_server --database-filename data/TPC-H-small.duckdb --print-queries
 ```
@@ -358,10 +352,9 @@ GIZMOSQL_PASSWORD="gizmosql_password" gizmosql_server --database-filename data/T
 
 ---
 
-## ⚙️ Backend Selection
+## ⚙️ Running the Server
 
-
-This option allows choosing from two backends: SQLite and DuckDB. It defaults to DuckDB.
+GizmoSQL now uses DuckDB as its only backend, providing optimized OLAP performance with parallel query execution.
 
 ```bash
 $ GIZMOSQL_PASSWORD="gizmosql_password" gizmosql_server --database-filename data/TPC-H-small.duckdb
@@ -371,37 +364,13 @@ GizmoSQL - Copyright © 2025 GizmoData LLC
 Apache Arrow version: 22.0.0
 WARNING - TLS is disabled for the GizmoSQL server - this is insecure.
 DuckDB version: v1.4.1
-Running Init SQL command: 
+Running Init SQL command:
 SET autoinstall_known_extensions = true;
-Running Init SQL command: 
+Running Init SQL command:
  SET autoload_known_extensions = true;
 Using database file: "data/TPC-H-small.duckdb"
 Print Queries option is set to: false
 GizmoSQL server version:  - with engine: DuckDB - will listen on grpc+tcp://0.0.0.0:31337
-GizmoSQL server - started
-```
-
-The above call is equivalent to running `gizmosql_server -B duckdb` or `gizmosql --backend duckdb`. To select SQLite run
-
-```bash
-GIZMOSQL_PASSWORD="gizmosql_password" gizmosql_server -B sqlite -D data/TPC-H-small.sqlite
-```
-or 
-```bash
-GIZMOSQL_PASSWORD="gizmosql_password" gizmosql_server --backend sqlite --database-filename data/TPC-H-small.sqlite
-```
-The above will produce output similar to the following:
-
-```bash
-GizmoSQL - Copyright © 2025 GizmoData LLC
- Licensed under the Apache License, Version 2.0
- https://www.apache.org/licenses/LICENSE-2.0
-Apache Arrow version: 22.0.0
-WARNING - TLS is disabled for the GizmoSQL server - this is insecure.
-SQLite version: 3.46.1
-Using database file: "/Users/philip/Documents/git/gizmosql/data/TPC-H-small.sqlite"
-Print Queries option is set to: false
-GizmoSQL server version:  - with engine: SQLite - will listen on grpc+tcp://0.0.0.0:31337
 GizmoSQL server - started
 ```
 

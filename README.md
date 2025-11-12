@@ -15,7 +15,7 @@
 
 **GizmoSQL** is a lightweight, high-performance SQL server built on:
 
-- 🦆 [DuckDB](https://duckdb.org) or 🗃️ [SQLite](https://sqlite.org) for query execution
+- 🦆 [DuckDB](https://duckdb.org) for query execution
 - 🚀 [Apache Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) for fast, modern connectivity
 - 🔒 Middleware-based auth with optional TLS & JWT
 
@@ -27,7 +27,7 @@ Originally forked from [`sqlflite`](https://github.com/voltrondata/sqlflite) —
 
 - 🛰️ **Deploy Anywhere** — Run as a container, native binary, or in Kubernetes
 - 📦 **Columnar Fast** — Leverages Arrow columnar format for high-speed transfers
-- ⚙️ **Dual Backends** — Switch between DuckDB and SQLite at runtime
+- ⚡ **DuckDB Powered** — OLAP-optimized query engine with parallel execution
 - 🔐 **Built-in TLS + Auth** — Password-based login + signed JWT tokens
 - 📈 **Super Cheap Analytics** — TPC-H SF 1000 in 161s for ~$0.17 on Azure
 - 🧪 **CLI, Python, JDBC, SQLAlchemy, Ibis, WebSocket** — Pick your interface
@@ -39,7 +39,6 @@ Originally forked from [`sqlflite`](https://github.com/voltrondata/sqlflite) —
 | Component                                                                        | Version |
 |----------------------------------------------------------------------------------|---------|
 | [DuckDB](https://duckdb.org)                                                     | v1.4.1  |
-| [SQLite](https://sqlite.org)                                                     | 3.50.4  |
 | [Apache Arrow (Flight SQL)](https://arrow.apache.org/docs/format/FlightSql.html) | 22.0.0 |
 | [jwt-cpp](https://thalhammer.github.io/jwt-cpp/)                                 | v0.7.1  |
 | [nlohmann/json](https://json.nlohmann.me)                                        | v3.12.0 |
@@ -161,22 +160,20 @@ GIZMOSQL_PASSWORD="..." gizmosql_server --database-filename ./data/your.db --pri
 
 ## 🧪 Advanced Features
 
-- ✅ DuckDB + SQLite backend support
+- ✅ DuckDB backend with optimized performance settings
 - ✅ TLS & optional mTLS
 - ✅ JWT-based auth (automatically issued, signed server-side)
 - ✅ Server initialization via `INIT_SQL_COMMANDS` or `INIT_SQL_COMMANDS_FILE`
 - ✅ Slim Docker image for minimal runtime
+- ✅ Query timeout control
 
 ---
 
-## 🛠 Backend Selection
+## 🛠 Running the Server
 
 ```bash
-# DuckDB (default)
-gizmosql_server -B duckdb --database-filename data/foo.duckdb
-
-# SQLite
-gizmosql_server -B sqlite --database-filename data/foo.sqlite
+# Start GizmoSQL with DuckDB
+gizmosql_server --database-filename data/foo.duckdb
 ```
 
 > [!TIP]

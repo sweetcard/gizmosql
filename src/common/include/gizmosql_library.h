@@ -27,14 +27,14 @@ const std::string DEFAULT_GIZMOSQL_USERNAME = "gizmosql_username";
 const int DEFAULT_FLIGHT_PORT = 31337;
 const int32_t DEFAULT_QUERY_TIMEOUT_SECONDS = 0;  // Unlimited timeout
 
-enum class BackendType { duckdb, sqlite };
+enum class BackendType { duckdb };  // Only DuckDB is supported
 
 /**
  * @brief Run a GizmoSQL Server with the specified configuration.
  *
  * This function initializes and runs a GizmoSQL Server with the given parameters.
  *
- * @param backend The backend to use (duckdb or sqlite).
+ * @param backend The backend to use (only duckdb is supported).
  * @param database_filename The path to the database file.
  * @param hostname The hostname for the GizmoSQL Server. Default is "" - if so, we use environment variable: "GIZMOSQL_HOSTNAME",
  *   and fallback to: DEFAULT_GIZMOSQL_HOSTNAME if that is not set.

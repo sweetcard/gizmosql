@@ -30,7 +30,6 @@
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 
-#include "sqlite_server.h"
 #include "duckdb_server.h"
 #include "flight_sql_fwd.h"
 #include "gizmosql_logging.h"
@@ -121,40 +120,31 @@ arrow::Result<std::shared_ptr<flight::sql::FlightSqlServerBase>> FlightSQLServer
 
   std::shared_ptr<flight::sql::FlightSqlServerBase> server = nullptr;
 
-  std::string db_type = "";
-  if (backend == BackendType::sqlite) {
-    db_type = "SQLite";
-    std::shared_ptr<gizmosql::sqlite::SQLiteFlightSqlServer> sqlite_server = nullptr;
-    ARROW_ASSIGN_OR_RAISE(sqlite_server, gizmosql::sqlite::SQLiteFlightSqlServer::Create(
-                                             database_filename, read_only));
-    RUN_INIT_COMMANDS(sqlite_server, init_sql_commands);
-    server = sqlite_server;
-  } else if (backend == BackendType::duckdb) {
-    db_type = "DuckDB";
-    std::shared_ptr<gizmosql::ddb::DuckDBFlightSqlServer> duckdb_server = nullptr;
-    ARROW_ASSIGN_OR_RAISE(duckdb_server,
-                          gizmosql::ddb::DuckDBFlightSqlServer::Create(
-                              database_filename, read_only, print_queries, query_timeout))
-    // Run additional commands (first) for the DuckDB back-end...
-    auto duckdb_init_sql_commands =
-        "SET autoinstall_known_extensions = true; "
-        "SET autoload_known_extensions = true; "
-        // Performance optimizations
-        "SET threads = " + std::to_string(std::thread::hardware_concurrency()) + "; "
-        "SET max_memory = '80%'; "
-        "SET temp_directory = '/tmp/gizmosql'; "
-        // Enable optimizer
-        "SET enable_optimizer = true; "
-        "SET optimizer_use_statistics = true; "
-        "SET enable_optimizer_statistics = true; "
-        // Parallel execution settings
-        "SET parallel_aggregation = true; "
-        "SET parallel_join = true; "
-        "SET preserve_insertion_order = false;" +  // Performance over order
-        init_sql_commands;
-    RUN_INIT_COMMANDS(duckdb_server, duckdb_init_sql_commands);
-    server = duckdb_server;
-  }
+  std::string db_type = "DuckDB";
+  // GizmoSQL now only supports DuckDB backend
+  std::shared_ptr<gizmosql::ddb::DuckDBFlightSqlServer> duckdb_server = nullptr;
+  ARROW_ASSIGN_OR_RAISE(duckdb_server,
+                        gizmosql::ddb::DuckDBFlightSqlServer::Create(
+                            database_filename, read_only, print_queries, query_timeout))
+  // Run additional commands (first) for the DuckDB back-end...
+  auto duckdb_init_sql_commands =
+      "SET autoinstall_known_extensions = true; "
+      "SET autoload_known_extensions = true; "
+      // Performance optimizations
+      "SET threads = " + std::to_string(std::thread::hardware_concurrency()) + "; "
+      "SET max_memory = '80%'; "
+      "SET temp_directory = '/tmp/gizmosql'; "
+      // Enable optimizer
+      "SET enable_optimizer = true; "
+      "SET optimizer_use_statistics = true; "
+      "SET enable_optimizer_statistics = true; "
+      // Parallel execution settings
+      "SET parallel_aggregation = true; "
+      "SET parallel_join = true; "
+      "SET preserve_insertion_order = false;" +  // Performance over order
+      init_sql_commands;
+  RUN_INIT_COMMANDS(duckdb_server, duckdb_init_sql_commands);
+  server = duckdb_server;
 
   GIZMOSQL_LOG(INFO) << "Using database file: " << database_filename;
 

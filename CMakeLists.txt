@@ -45,28 +45,6 @@ find_package(Arrow REQUIRED PATHS ${ARROW_INSTALL_DIR} NO_DEFAULT_PATH)
 find_package(ArrowFlight REQUIRED PATHS ${ARROW_INSTALL_DIR} NO_DEFAULT_PATH)
 find_package(ArrowFlightSql REQUIRED PATHS ${ARROW_INSTALL_DIR} NO_DEFAULT_PATH)
 
-# --------------------- SQLite ---------------------
-configure_file(third_party/SQLite_CMakeLists.txt.in sqlite/CMakeLists.txt)
-execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" . -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/sqlite"
-        COMMAND_ERROR_IS_FATAL ANY
-)
-execute_process(COMMAND "${CMAKE_COMMAND}" --build .
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/sqlite"
-        COMMAND_ERROR_IS_FATAL ANY
-)
-execute_process(COMMAND "${CMAKE_COMMAND}" --install .
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/sqlite"
-        COMMAND_ERROR_IS_FATAL ANY
-)
-
-set(SQLITE_INCLUDE_DIR "${CMAKE_BINARY_DIR}/third_party/sqlite/sqlite_project-install/include")
-set(SQLITE_LIBRARY_PATH "${CMAKE_BINARY_DIR}/third_party/sqlite/sqlite_project-install/lib/libsqlite3.a")
-
-add_library(sqlite STATIC IMPORTED)
-set_property(TARGET sqlite PROPERTY IMPORTED_LOCATION ${SQLITE_LIBRARY_PATH})
-set_property(TARGET sqlite PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${SQLITE_INCLUDE_DIR})
-
 # --------------------- DuckDB ---------------------
 
 configure_file(third_party/DuckDB_CMakeLists.txt.in duckdb/CMakeLists.txt)
@@ -142,15 +120,6 @@ find_package(Threads REQUIRED)
 set(Boost_USE_STATIC_LIBS ON)
 find_package(Boost COMPONENTS program_options REQUIRED)
 
-set(GIZMOSQL_SQLITE_SERVER_SRCS
-        src/sqlite/sqlite_sql_info.cc
-        src/sqlite/sqlite_type_info.cc
-        src/sqlite/sqlite_statement.cc
-        src/sqlite/sqlite_statement_batch_reader.cc
-        src/sqlite/sqlite_server.cc
-        src/sqlite/sqlite_tables_schema_batch_reader.cc)
-
-
 set(GIZMOSQL_DUCKDB_SERVER_SRCS
         src/duckdb/duckdb_sql_info.cpp
         src/duckdb/duckdb_type_info.cpp
@@ -165,7 +134,6 @@ add_library(gizmosqlserver STATIC
         src/common/gizmosql_library.cpp
         src/common/gizmosql_security.cpp
         src/common/access_log_middleware.cpp
-        ${GIZMOSQL_SQLITE_SERVER_SRCS}
         ${GIZMOSQL_DUCKDB_SERVER_SRCS}
 )
 
@@ -177,10 +145,8 @@ target_include_directories(gizmosqlserver
         PUBLIC
         src/common/include
         PRIVATE
-        src/sqlite
         src/duckdb
         src/common/include/detail
-        ${SQLITE_INCLUDE_DIR}
         ${DUCKDB_INCLUDE_DIR}
         ${JWT_CPP_INCLUDE_DIR}
 )
@@ -189,7 +155,6 @@ target_link_libraries(gizmosqlserver
         PRIVATE
         Threads::Threads
         ArrowFlightSql::arrow_flight_sql_static
-        sqlite
         duckdb
         ${Boost_LIBRARIES}
         nlohmann_json::nlohmann_json
