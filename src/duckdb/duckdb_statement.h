@@ -43,7 +43,7 @@ std::shared_ptr<arrow::DataType> GetDataTypeFromDuckDbType(
 /// \return             A Column Metadata object.
 flight::sql::ColumnMetadata GetColumnMetadata(int column_type, const char* table);
 
-class DuckDBStatement {
+class DuckDBStatement : public std::enable_shared_from_this<DuckDBStatement> {
  public:
   static arrow::Result<std::shared_ptr<DuckDBStatement>> Create(
       std::shared_ptr<ClientSession> client_session, const std::string& handle,

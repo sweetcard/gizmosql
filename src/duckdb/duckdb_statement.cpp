@@ -38,6 +38,79 @@
 using arrow::Status;
 using duckdb::QueryResult;
 
+namespace {
+// Simple orphaned future manager for handling timed-out query threads
+// This prevents blocking on future destruction when queries don't respond to Interrupt()
+class SimpleOrphanedFutureManager {
+ private:
+  struct FutureEntry {
+    std::shared_future<arrow::Result<int>> future;  // Type matches Execute()'s async return type
+    std::chrono::steady_clock::time_point added_at;
+    std::string session_id;
+  };
+
+  std::deque<FutureEntry> orphaned_futures_;
+  mutable std::mutex mutex_;
+
+  // Periodically clean up completed futures
+  void CleanupCompleted() {
+    auto now = std::chrono::steady_clock::now();
+
+    orphaned_futures_.erase(
+        std::remove_if(orphaned_futures_.begin(), orphaned_futures_.end(),
+                      [&now](const FutureEntry& entry) {
+                        // Check if future is ready
+                        if (entry.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                          try {
+                            entry.future.get();  // Consume the result
+                          } catch (...) {
+                            // Ignore exceptions
+                          }
+                          return true;  // Remove
+                        }
+
+                        // Remove very old futures (>1 hour) to prevent unbounded growth
+                        auto age = std::chrono::duration_cast<std::chrono::hours>(now - entry.added_at);
+                        if (age.count() >= 1) {
+                          GIZMOSQL_LOG(ERROR) << "Removing orphaned future older than 1 hour for session: "
+                                              << entry.session_id;
+                          return true;
+                        }
+
+                        return false;
+                      }),
+        orphaned_futures_.end());
+  }
+
+ public:
+  void AddOrphanedFuture(
+      std::shared_future<arrow::Result<int>> future,
+      const std::string& session_id) {
+    std::scoped_lock lock(mutex_);
+
+    // Clean up completed futures before adding new one
+    if (orphaned_futures_.size() > 10) {
+      CleanupCompleted();
+    }
+
+    orphaned_futures_.push_back({std::move(future), std::chrono::steady_clock::now(), session_id});
+    GIZMOSQL_LOG(WARNING) << "Added orphaned future for session: " << session_id
+                          << " (total: " << orphaned_futures_.size() << ")";
+  }
+
+  size_t GetOrphanedCount() const {
+    std::scoped_lock lock(mutex_);
+    return orphaned_futures_.size();
+  }
+};
+
+// Global instance
+SimpleOrphanedFutureManager& GetOrphanedFutureManager() {
+  static SimpleOrphanedFutureManager instance;
+  return instance;
+}
+}  // anonymous namespace
+
 namespace gizmosql::ddb {
 std::shared_ptr<arrow::DataType> GetDataTypeFromDuckDbType(
     const duckdb::LogicalType duckdb_type) {
@@ -182,72 +255,74 @@ arrow::Result<int> DuckDBStatement::Execute() {
   std::string logged_sql;
 
   // Launch execution in a separate thread
+  // IMPORTANT:
+  // - Capture logged_sql by VALUE (not reference) to avoid dangling reference
+  // - Capture shared_from_this() to keep DuckDBStatement alive during execution
+  // This prevents use-after-free if statement is evicted from cache or destroyed
+  // while the orphaned future manager still holds the future
   auto future =
-      std::async(std::launch::async, [this, &logged_sql]() -> arrow::Result<int> {
-        if (use_direct_execution_) {
-          logged_sql = redact_sql_for_logs(sql_);
+      std::async(std::launch::async, [self = shared_from_this(), logged_sql]() mutable -> arrow::Result<int> {
+        if (self->use_direct_execution_) {
+          logged_sql = redact_sql_for_logs(self->sql_);
 
-          if (!bind_parameters.empty()) {
-            client_session_->active_sql_handle = "";
+          if (!self->bind_parameters.empty()) {
             return arrow::Status::Invalid(
                 "Direct query execution does not support bind parameters");
           }
 
-          auto result = client_session_->connection->Query(sql_);
-          client_session_->active_sql_handle = "";
+          auto result = self->client_session_->connection->Query(self->sql_);
 
           if (result->HasError()) {
-            if (log_queries_) {
+            if (self->log_queries_) {
               GIZMOSQL_LOGKV(
                   WARNING, "Client SQL command failed direct execution",
-                  {"peer", client_session_->peer}, {"kind", "sql"}, {"status", "failure"},
-                  {"session_id", client_session_->session_id},
-                  {"user", client_session_->username}, {"role", client_session_->role},
-                  {"statement_handle", handle_}, {"error", result->GetError()},
-                  {"sql", logged_sql}, {"query_timeout", std::to_string(query_timeout_)});
+                  {"peer", self->client_session_->peer}, {"kind", "sql"}, {"status", "failure"},
+                  {"session_id", self->client_session_->session_id},
+                  {"user", self->client_session_->username}, {"role", self->client_session_->role},
+                  {"statement_handle", self->handle_}, {"error", result->GetError()},
+                  {"sql", logged_sql}, {"query_timeout", std::to_string(self->query_timeout_)});
             }
             return arrow::Status::ExecutionError("Direct query execution error: ",
                                                  result->GetError());
           }
 
-          query_result_ = std::move(result);
+          self->query_result_ = std::move(result);
         } else {
-          logged_sql = redact_sql_for_logs(stmt_->query);
+          logged_sql = redact_sql_for_logs(self->stmt_->query);
 
-          if (log_queries_ && !bind_parameters.empty()) {
+          if (self->log_queries_ && !self->bind_parameters.empty()) {
             std::stringstream params_str;
             params_str << "[";
-            for (size_t i = 0; i < bind_parameters.size(); i++) {
+            for (size_t i = 0; i < self->bind_parameters.size(); i++) {
               if (i > 0) params_str << ", ";
-              params_str << "'" << bind_parameters[i].ToString() << "'";
+              params_str << "'" << self->bind_parameters[i].ToString() << "'";
             }
             params_str << "]";
 
             GIZMOSQL_LOGKV_DYNAMIC(
-                log_level_, "Executing prepared statement with bind parameters",
-                {"peer", client_session_->peer}, {"kind", "sql"}, {"status", "executing"},
-                {"session_id", client_session_->session_id},
-                {"user", client_session_->username}, {"role", client_session_->role},
-                {"statement_handle", handle_}, {"bind_parameters", params_str.str()},
-                {"param_count", std::to_string(bind_parameters.size())},
-                {"query_timeout", std::to_string(query_timeout_)});
+                self->log_level_, "Executing prepared statement with bind parameters",
+                {"peer", self->client_session_->peer}, {"kind", "sql"}, {"status", "executing"},
+                {"session_id", self->client_session_->session_id},
+                {"user", self->client_session_->username}, {"role", self->client_session_->role},
+                {"statement_handle", self->handle_}, {"bind_parameters", params_str.str()},
+                {"param_count", std::to_string(self->bind_parameters.size())},
+                {"query_timeout", std::to_string(self->query_timeout_)});
           }
 
-          query_result_ = stmt_->Execute(bind_parameters);
-          client_session_->active_sql_handle = "";
+          self->query_result_ = self->stmt_->Execute(self->bind_parameters);
 
-          if (query_result_->HasError()) {
-            if (log_queries_) {
+          if (self->query_result_->HasError()) {
+            if (self->log_queries_) {
               GIZMOSQL_LOGKV(
                   WARNING, "Client SQL command failed execution",
-                  {"peer", client_session_->peer}, {"kind", "sql"}, {"status", "failure"},
-                  {"session_id", client_session_->session_id},
-                  {"user", client_session_->username}, {"role", client_session_->role},
-                  {"statement_handle", handle_}, {"error", query_result_->GetError()},
-                  {"sql", logged_sql}, {"query_timeout", std::to_string(query_timeout_)});
+                  {"peer", self->client_session_->peer}, {"kind", "sql"}, {"status", "failure"},
+                  {"session_id", self->client_session_->session_id},
+                  {"user", self->client_session_->username}, {"role", self->client_session_->role},
+                  {"statement_handle", self->handle_}, {"error", self->query_result_->GetError()},
+                  {"sql", logged_sql}, {"query_timeout", std::to_string(self->query_timeout_)});
             }
             return arrow::Status::ExecutionError("An execution error has occurred: ",
-                                                 query_result_->GetError());
+                                                 self->query_result_->GetError());
           }
         }
 
@@ -285,9 +360,17 @@ arrow::Result<int> DuckDBStatement::Execute() {
         }
       } else {
         // Thread still running after interrupt (rare with DuckDB)
+        // Move the future to orphaned future manager to prevent blocking on destruction
         GIZMOSQL_LOG(WARNING) << "Query thread did not exit after Interrupt() for session: "
                               << client_session_->session_id
-                              << " - potential thread leak";
+                              << " - moving to orphaned future manager";
+
+        // Convert to shared_future and hand off to manager
+        std::shared_future<arrow::Result<int>> shared_fut = future.share();
+        GetOrphanedFutureManager().AddOrphanedFuture(shared_fut, client_session_->session_id);
+
+        // Note: The original future is now in an empty state after share(),
+        // so it won't block on destruction
       }
     } catch (const std::exception& e) {
       GIZMOSQL_LOG(ERROR) << "Exception during timeout cleanup: " << e.what();
@@ -311,6 +394,10 @@ arrow::Result<int> DuckDBStatement::Execute() {
 
   // Get the result from the future
   auto result = future.get();
+
+  // Clear active SQL handle now that execution is complete
+  // This is done by the main thread only, avoiding race conditions
+  client_session_->active_sql_handle = "";
 
   end_time_ = std::chrono::steady_clock::now();
   if (log_queries_ && result.ok()) {
